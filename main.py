@@ -4,6 +4,8 @@ import subprocess
 import logging
 import socket
 
+from ceph.deployment.drive_selection.matchers import logger
+
 
 class Distro(enum.Enum):
     REDHAT=1
@@ -11,31 +13,61 @@ class Distro(enum.Enum):
     UNKNOWN=3
 
 class InitSystem(enum.Enum):
-    CGROUPFS=1
-    SYSTEMD=2
+    CGROUPFS="cgroup"
+    SYSTEMD="systemd"
+    UNKNOWN="unknown"
 
+class ContainerRuntime(enum.Enum):
+    CONTAINERD="containerd"
+    CRIO="CRI-O"
+    DOCKER="Docker Engine"
+    UNKNOWN="unknown"
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def main():
     logger.info("K8s installer started")
-
     distro = check_distro()
     if distro == Distro.UNKNOWN:
-        logger.info("K8s installer failed at OS distribution check")
-        return False
+        app_failure("K8s installer failed at OS distribution check")
+
+    if check_c_library(distro) is False:
+        app_failure("K8s installer failed at checking systems C library")
 
     if not check_k8s_ports():
-        logger.info("K8s installer failed at checking ports")
-        return False
+        app_failure("K8s installer failed at checking systems opened ports")
+
+    init_system: InitSystem = check_init_system()
+    if init_system.UNKNOWN:
+        app_failure("K8s installation failed at checking init system")
 
     if not write_text_file("/etc/sysctl.d/k8s.conf", "net.ipv4.ip_forward = 1\r"):
-        logger.info("K8s installer failed at writing k8s.conf")
+        app_failure("K8s installer failed at writing k8s.conf")
+    else:
+        result = try_run_command(["sudo", "sysctl", "--system"])
+        if result is None:
+            app_failure("K8s installer failed at applying sysctl changes")
 
-    try_run_command(["sudo", "sysctl", "--system"])
+    if check_container_runtime == ContainerRuntime.UNKNOWN:
+        app_failure("K8s installer failed at checking systems container runtime")
 
     logger.info("K8s installer finished successfully")
 
+def check_c_library(distro: Distro):
+    if distro.DEBIAN:
+        command = ["dpkg", "-s", "libc6"]
+    else:
+        command = ["dnf", "info", "glibc"]
+
+    result = try_run_command(command)
+
+    if result is None:
+        return False
+    else:
+        logger.info("C library present")
+        return True
 
 def check_k8s_ports():
     ports_success = True
@@ -52,7 +84,7 @@ def check_k8s_ports():
 
     return ports_success
 
-def read_character_file(path):
+def try_read_character_file(path):
     logger.info("Reading character file")
     try:
         with open(path, "r") as f:
@@ -63,28 +95,31 @@ def read_character_file(path):
     return content
 
 
-
-
 def check_init_system():
+    init_system: InitSystem = InitSystem.UNKNOWN
     if os.path.exists("/run/systemd/system"):
-        logger.info("Systems init system is systemd")
+        init_system = InitSystem.SYSTEMD
     else:
-        try:
-            with open("/proc/1/cgroup", "r") as f:
+        content = try_read_character_file("/proc/1/cgroup")
+        if InitSystem.SYSTEMD.value in content:
+            init_system = InitSystem.SYSTEMD
+        elif InitSystem.CGROUPFS.value in content:
+            init_system = InitSystem.CGROUPFS
+
+        logger.info("Systems init system is ", init_system.name)
+    return init_system
 
 
-
-def app_failure():
-    logger.error("Application failure")
+def app_failure(msg: str):
+    logger.critical(msg)
     exit(1)
 
-
-def try_run_command(command):
-    logger.info("Running command")
-
+def try_run_command(command: list[str]):
     command_str = ""
     for elem in command:
         command_str += " " + elem
+
+    logger.info(f"Running command: {command_str}")
 
     result = None
     try:
@@ -119,16 +154,19 @@ def check_distro():
     distro = Distro.UNKNOWN
     command = ["apt-get", "--version"]
     result = try_run_command(command)
+
     if result is not None:
         distro = Distro.DEBIAN
+        logger.info("Debian based distribution")
     else:
         command = ["dnf", "--version"]
         result = try_run_command(command)
+        logger.info("RedHat based distribution")
 
         if result is not None:
             distro = Distro.REDHAT
         else:
-            logger.info("Failed to execute apt and dnf")
+            logger.info("Failed to execute apt nor dnf")
 
     return distro
 
@@ -152,7 +190,29 @@ def append_text_file(path, text):
         file.write(text)
         logger.info("File written")
 
-    logger.info()
+def check_container_runtime():
+    logger.info(f"Checking systems container runtime")
+
+    if os.path.exists("/var/run/containerd"):
+        runtime = ContainerRuntime.CONTAINERD
+        logger.info("Containerd runtime")
+    elif os.path.exists("/var/run/crio"):
+        runtime = ContainerRuntime.CRIO
+        logger.info("CRI-O runtime")
+    elif os.path.exists("/var/run/cri-dockerd.sock"):
+        runtime = ContainerRuntime.DOCKER
+        logger.info("Docker Engine runtime")
+    else:
+        runtime = ContainerRuntime.UNKNOWN
+        logger.error("Unknown container runtime")
+
+    return runtime.UNKNOWN
+
+def check_container_runtime_settings(runtime: ContainerRuntime, init_system: InitSystem):
+    logger.info("Checking if container runtime is compatible with init system")
+    if runtime.CONTAINERD:
+
+
 
 if __name__ == "__main__":
     main()
